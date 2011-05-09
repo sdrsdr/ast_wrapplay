@@ -46,8 +46,22 @@ ASTERISK_FILE_VERSION(__FILE__, "0.1")
 #include "asterisk/translate.h"
 #include "asterisk/app.h"
 
-char *wrap_synopsis = "Call a wrapper to produse audo stream for a channel";
-char *wrap_descrip = "  wrapPlayer(Wraper, Src):\n"
+
+#define ALAW_SAMPLEFORMAT AST_FORMAT_ALAW
+#define ALAW_SAMPLESPERSECOND 8000
+#define ALAW_SAMPLESINFRAME 160
+#define ALAW_BYPESPERSAMPLE 1
+
+#define SLIN_SAMPLEFORMAT AST_FORMAT_SLINEAR
+#define SLIN_SAMPLESPERSECOND 8000
+#define SLIN_SAMPLESINFRAME 160
+#define SLIN_BYPESPERSAMPLE 2
+
+
+
+static char *app = "wrapPlayer";
+static char *wrap_synopsis = "Call a wrapper to produse audo stream for a channel (ALAW format)";
+static char *wrap_descrip = "  wrapPlayer(Wraper, Src):\n"
 "Used to start a wrapper script/program that shall write a sample stream to it's stdout\n"
 "and it will be send to the calling channel. Curenly expecting 8KHz ALaw samples\n"
 "wrapper base might be something like:\n"
@@ -57,17 +71,30 @@ char *wrap_descrip = "  wrapPlayer(Wraper, Src):\n"
 ;
 
 
-static char *app = "wrapPlayer";
+static char *apps = "wrapPlayerS";
+static char *wrap_synopsiss = "Call a wrapper to produse audo stream for a channel (SLINEAR format)";
+static char *wrap_descrips = "  wrapPlayerS(Wraper, Src):\n"
+"Used to start a wrapper script/program that shall write a sample stream to it's stdout\n"
+"and it will be send to the calling channel. Curenly expecting 8KHz signed 2 bytes samples (SLINEAR)\n"
+"wrapper base might be something like:\n"
+"  exec ffmpeg -v 0 -i $1 -y -f s16le -ar 8000 -ac 1 - 2>/dev/null\n"
+"NOTE! we just call the wraper, passing src as single parameter we don't do other parameter passing (for now)\n"
+//"\n"
+;
 
-static int wrapplay(char *wrapper, char *filename, int fd)
+
+
+static int wrapplay(char *wrapper, char *src, int fd)
 {
+	ast_verbose ("wrapPlayer(S?) will execute  %s %s \n",wrapper,src);
 	int res;
-	int x;
+//	int x;
 	sigset_t fullset, oldset;
+/*	
 #ifdef HAVE_CAP
 	cap_t cap;
 #endif
-
+*/
 	sigfillset(&fullset);
 	pthread_sigmask(SIG_BLOCK, &fullset, &oldset);
 
@@ -78,28 +105,30 @@ static int wrapplay(char *wrapper, char *filename, int fd)
 		pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 		return res;
 	}
+/*
 #ifdef HAVE_CAP
 	cap = cap_from_text("cap_net_admin-eip");
 
 	if (cap_set_proc(cap)) {
-		/* Careful with order! Logging cannot happen after we close FDs */
 		ast_log(LOG_WARNING, "Unable to remove capabilities.\n");
 	}
 	cap_free(cap);
 #endif
+*/	
+	
 	if (ast_opt_high_priority)
 		ast_set_priority(0);
 	signal(SIGPIPE, SIG_DFL);
 	pthread_sigmask(SIG_UNBLOCK, &fullset, NULL);
 
 	dup2(fd, STDOUT_FILENO);
-	for (x=STDERR_FILENO + 1;x<256;x++) {
-		close(x);
-	}
+	//for (x=STDERR_FILENO + 1;x<256;x++) {
+	//	close(x);
+	//}
 
 	/* Execute wrapper */
-	execl(wrapper,  filename, (char *)NULL);
-	fprintf(stderr, "Execute of %s %s failed\n",wrapper,filename);
+	execl(wrapper, wrapper, src, (char *)NULL);
+	fprintf(stderr, "Execute of %s %s failed\n",wrapper,src);
 	_exit(0);
 }
 
@@ -118,7 +147,33 @@ static int timed_read(int fd, void *data, int datalen, int timeout)
 	
 }
 
-static int wrap_exec(struct ast_channel *chan, void *data)
+struct myframe_base {
+	struct ast_frame f;
+	char frdata[];
+};
+
+struct myframe_alaw {
+	struct myframe_base b;
+	char data[AST_FRIENDLY_OFFSET+(2+ALAW_SAMPLESINFRAME)*ALAW_BYPESPERSAMPLE];
+};
+
+struct myframe_slin {
+	struct myframe_base b;
+	char data[AST_FRIENDLY_OFFSET+(2+SLIN_SAMPLESINFRAME)*SLIN_BYPESPERSAMPLE];
+};
+
+
+static int wrap_exec_real(struct ast_channel *chan, void *data, struct myframe_base * myf, int sampleformat, int samplespersecond, int bypespersample,int samplesinframe);
+static int wrap_exec(struct ast_channel *chan, void *data) {
+	struct myframe_alaw myf;
+	return wrap_exec_real(chan,data,&myf.b,ALAW_SAMPLEFORMAT,ALAW_SAMPLESPERSECOND,ALAW_BYPESPERSAMPLE,ALAW_SAMPLESINFRAME);
+}
+static int wrap_execs(struct ast_channel *chan, void *data) {
+	struct myframe_slin myf;
+	return wrap_exec_real(chan,data,&myf.b,SLIN_SAMPLEFORMAT,SLIN_SAMPLESPERSECOND,SLIN_BYPESPERSAMPLE,SLIN_SAMPLESINFRAME);
+}
+
+static int wrap_exec_real(struct ast_channel *chan, void *data, struct myframe_base * myf, int sampleformat, int samplespersecond, int bypespersample,int samplesinframe)
 {
 	char *tmp;
 	
@@ -138,20 +193,18 @@ static int wrap_exec(struct ast_channel *chan, void *data)
 	
 	int res=0;
 	int fds[2];
-	int ms = -1;
+	int waitms = 500;
+	int msrem = -1;
 	int pid = -1;
 	int owriteformat;
 	int timeout = 2000;
-	struct timeval next;
+	
+	
+	//frame to read channel events in
 	struct ast_frame *f;
-	struct myframe {
-		struct ast_frame f;
-		char offset[AST_FRIENDLY_OFFSET];
-		short frdata[160];
-	} myf = {
-		.f = { 0, },
-	};
+	
 
+	
 	if (ast_strlen_zero(data)) {
 		ast_log(LOG_WARNING, "wrap Playback requires an argument (wrapper,source)\n");
 		return -1;
@@ -165,40 +218,49 @@ static int wrap_exec(struct ast_channel *chan, void *data)
 	ast_stopstream(chan);
 
 	owriteformat = chan->writeformat;
-	res = ast_set_write_format(chan, AST_FORMAT_ALAW);
-	if (res < 0) {
-		ast_log(LOG_WARNING, "Unable to set write format to alaw\n");
-		return -1;
+	if (owriteformat!=sampleformat) {
+		res = ast_set_write_format(chan, sampleformat);
+		if (res < 0) {
+			ast_log(LOG_WARNING, "Unable to set suitable write format (%x)\n",sampleformat);
+			return -1;
+		}
+	} else {
+		ast_verbose ("Chanel format is already suitble (%x)\n",sampleformat);
 	}
 	
 	
 	res = wrapplay(args.wrapper, args.src, fds[1]);
 	if (!strncasecmp(args.src, "http://", 7)) {
-		timeout = 10000;
+		timeout = 5000;
 	}
-	/* Wait 1000 ms first */
-	next = ast_tvnow();
-	next.tv_sec += 1;
+	if (!strncasecmp(args.src, "rtsp://", 7)) {
+		timeout = 5000;
+	}
+	int seq=0;
+	long ts=0;
 	if (res >= 0) {
 		pid = res;
 		/* Order is important -- there's almost always going to be mp3...  we want to prioritize the
 		   user */
 		for (;;) {
-			ms = ast_tvdiff_ms(next, ast_tvnow());
-			if (ms <= 0) {
-				res = timed_read(fds[0], myf.frdata, sizeof(myf.frdata), timeout);
+			if (waitms <= 0) {
+				res = timed_read(fds[0], myf->frdata+AST_FRIENDLY_OFFSET, samplesinframe*bypespersample, timeout);
 				if (res > 0) {
-					myf.f.frametype = AST_FRAME_VOICE;
-					myf.f.subclass = AST_FORMAT_ALAW;
-					myf.f.datalen = res;
-					myf.f.samples = res / 2;
-					myf.f.mallocd = 0;
-					myf.f.offset = AST_FRIENDLY_OFFSET;
-					myf.f.src = __PRETTY_FUNCTION__;
-					myf.f.delivery.tv_sec = 0;
-					myf.f.delivery.tv_usec = 0;
-					myf.f.data = myf.frdata;
-					if (ast_write(chan, &myf.f) < 0) {
+					myf->f.frametype = AST_FRAME_VOICE;
+					myf->f.subclass = sampleformat;
+					myf->f.samples = res/bypespersample;
+					myf->f.mallocd = 0;
+					myf->f.src = __PRETTY_FUNCTION__;
+					myf->f.delivery.tv_sec = 0;
+					myf->f.delivery.tv_usec = 0;
+					waitms=(myf->f.samples * 1000)/samplespersecond;
+					myf->f.len=waitms;
+					myf->f.seqno=seq; seq++;
+					myf->f.ts=ts; ts+=waitms;
+					
+					if (waitms>15) waitms-=7;
+					AST_FRAME_SET_BUFFER(&(myf->f),&(myf->frdata),AST_FRIENDLY_OFFSET,res);
+					if (ast_write(chan, &(myf->f)) < 0) {
 						res = -1;
 						break;
 					}
@@ -207,15 +269,14 @@ static int wrap_exec(struct ast_channel *chan, void *data)
 					res = 0;
 					break;
 				}
-				next = ast_tvadd(next, ast_samp2tv(myf.f.samples, 8000));
 			} else {
-				ms = ast_waitfor(chan, ms);
-				if (ms < 0) {
+				msrem = ast_waitfor(chan, waitms);
+				if (msrem < 0) {
 					ast_debug(1, "Hangup detected\n");
 					res = -1;
 					break;
 				}
-				if (ms) {
+				if (msrem) {
 					f = ast_read(chan);
 					if (!f) {
 						ast_debug(1, "Null frame == hangup() detected\n");
@@ -230,6 +291,7 @@ static int wrap_exec(struct ast_channel *chan, void *data)
 					}
 					ast_frfree(f);
 				} 
+				waitms=msrem;
 			}
 		}
 	}
@@ -240,7 +302,8 @@ static int wrap_exec(struct ast_channel *chan, void *data)
 		kill(pid, SIGKILL);
 	}
 	
-	if (!res && owriteformat)
+	if (!res && owriteformat!=chan->writeformat)
+		ast_verbose ("Resetting chanle write format to old write format (%x)\n",owriteformat);
 		ast_set_write_format(chan, owriteformat);
 	
 	if (pid > -1) {
@@ -249,14 +312,15 @@ static int wrap_exec(struct ast_channel *chan, void *data)
 	return res;
 }
 
+
 static int unload_module(void)
 {
-	return ast_unregister_application(app);
+	return ast_unregister_application(apps) || ast_unregister_application(app);
 }
 
 static int load_module(void)
 {
-	return ast_register_application(app, wrap_exec,wrap_synopsis, wrap_descrip);
+	return ast_register_application(apps, wrap_execs,wrap_synopsiss, wrap_descrips) || ast_register_application(app, wrap_exec,wrap_synopsis, wrap_descrip);
 }
 
-AST_MODULE_INFO_STANDARD(ASTERISK_GPL_KEY, "Silly wrapPlayer Application");
+AST_MODULE_INFO_STANDARD(ASTERISK_GPL_KEY, "Silly wrapPlayer/wrapPalayerS Applications for ALaw/SLINEAR formats");
