@@ -30,7 +30,7 @@
  
 #include "asterisk.h"
 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 238013 $")
+ASTERISK_FILE_VERSION(__FILE__, "0.1")
 
 #include <sys/time.h>
 #include <sys/types.h> 
@@ -62,18 +62,40 @@ static char *app = "wrapPlayer";
 static int wrapplay(char *wrapper, char *filename, int fd)
 {
 	int res;
+	int x;
+	sigset_t fullset, oldset;
+#ifdef HAVE_CAP
+	cap_t cap;
+#endif
 
-	res = ast_safe_fork(0);
+	sigfillset(&fullset);
+	pthread_sigmask(SIG_BLOCK, &fullset, &oldset);
+
+	res = fork();
 	if (res < 0) 
 		ast_log(LOG_WARNING, "Fork failed\n");
 	if (res) {
+		pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 		return res;
 	}
+#ifdef HAVE_CAP
+	cap = cap_from_text("cap_net_admin-eip");
+
+	if (cap_set_proc(cap)) {
+		/* Careful with order! Logging cannot happen after we close FDs */
+		ast_log(LOG_WARNING, "Unable to remove capabilities.\n");
+	}
+	cap_free(cap);
+#endif
 	if (ast_opt_high_priority)
 		ast_set_priority(0);
+	signal(SIGPIPE, SIG_DFL);
+	pthread_sigmask(SIG_UNBLOCK, &fullset, NULL);
 
 	dup2(fd, STDOUT_FILENO);
-	ast_close_fds_above_n(STDERR_FILENO);
+	for (x=STDERR_FILENO + 1;x<256;x++) {
+		close(x);
+	}
 
 	/* Execute wrapper */
 	execl(wrapper,  filename, (char *)NULL);
@@ -169,13 +191,13 @@ static int wrap_exec(struct ast_channel *chan, void *data)
 					myf.f.frametype = AST_FRAME_VOICE;
 					myf.f.subclass = AST_FORMAT_ALAW;
 					myf.f.datalen = res;
-					myf.f.samples = res;
+					myf.f.samples = res / 2;
 					myf.f.mallocd = 0;
 					myf.f.offset = AST_FRIENDLY_OFFSET;
 					myf.f.src = __PRETTY_FUNCTION__;
 					myf.f.delivery.tv_sec = 0;
 					myf.f.delivery.tv_usec = 0;
-					myf.f.data.ptr = myf.frdata;
+					myf.f.data = myf.frdata;
 					if (ast_write(chan, &myf.f) < 0) {
 						res = -1;
 						break;
